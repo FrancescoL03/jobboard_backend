@@ -371,6 +371,181 @@ Future<Response> inviaCandidatura(Request request, String id) async {
   }, stato: 201);
 }
 
+// S3: identifica l'azienda dalla sessione
+int? aziendaAutenticata(Request request) {
+  final autorizzazione = request.headers['authorization'] ?? '';
+
+  if (!autorizzazione.startsWith('Bearer ')) {
+    return null;
+  }
+
+  final token = autorizzazione.substring(7).trim();
+
+  return sessioni[token];
+}
+
+// S3: restituisce solo gli annunci dell'azienda autenticata
+Response annunciDellaAzienda(Request request) {
+  final aziendaId = aziendaAutenticata(request);
+
+  if (aziendaId == null) {
+    return errore('Accesso non autorizzato', 401);
+  }
+
+  final annunci = leggiDati('annunci');
+
+  final mieiAnnunci = annunci
+      .where((annuncio) => annuncio['aziendaId'] == aziendaId)
+      .toList()
+      .reversed
+      .toList();
+
+  return rispostaJson(mieiAnnunci);
+}
+
+// S3: candidature ricevute per uno specifico annuncio
+Response candidatureRicevute(Request request, String id) {
+  final aziendaId = aziendaAutenticata(request);
+
+  if (aziendaId == null) {
+    return errore('Accesso non autorizzato', 401);
+  }
+
+  final annuncioId = int.tryParse(id);
+
+  if (annuncioId == null) {
+    return errore('Annuncio non valido', 400);
+  }
+
+  final annunci = leggiDati('annunci');
+
+  Map<String, dynamic>? annuncio;
+
+  for (final elemento in annunci) {
+    if (elemento['id'] == annuncioId) {
+      annuncio = elemento;
+      break;
+    }
+  }
+
+  if (annuncio == null) {
+    return errore('Annuncio non trovato', 404);
+  }
+
+  // L'azienda può vedere solo le candidature ai propri annunci
+  if (annuncio['aziendaId'] != aziendaId) {
+    return errore('Non hai accesso a questo annuncio', 403);
+  }
+
+  final candidature = leggiDati('candidature');
+
+  final risultato = candidature
+      .where((c) => c['annuncioId'] == annuncioId)
+      .map(
+        (c) => {
+          'id': c['id'],
+          'nome': c['nome'],
+          'cognome': c['cognome'],
+          'email': c['email'],
+          'curriculumNome': c['curriculumNome'],
+        },
+      )
+      .toList()
+      .reversed
+      .toList();
+
+  return rispostaJson(risultato);
+}
+
+// S3: download protetto del curriculum
+Response scaricaCurriculum(Request request, String id) {
+  final aziendaId = aziendaAutenticata(request);
+
+  if (aziendaId == null) {
+    return errore('Accesso non autorizzato', 401);
+  }
+
+  final candidaturaId = int.tryParse(id);
+
+  if (candidaturaId == null) {
+    return errore('Candidatura non valida', 400);
+  }
+
+  final candidature = leggiDati('candidature');
+
+  Map<String, dynamic>? candidatura;
+
+  for (final elemento in candidature) {
+    if (elemento['id'] == candidaturaId) {
+      candidatura = elemento;
+      break;
+    }
+  }
+
+  if (candidatura == null) {
+    return errore('Candidatura non trovata', 404);
+  }
+
+  final annunci = leggiDati('annunci');
+
+  Map<String, dynamic>? annuncio;
+
+  for (final elemento in annunci) {
+    if (elemento['id'] == candidatura['annuncioId']) {
+      annuncio = elemento;
+      break;
+    }
+  }
+
+  // Proteggiamo anche il PDF, non soltanto la lista
+  if (annuncio == null || annuncio['aziendaId'] != aziendaId) {
+    return errore('Accesso al curriculum negato', 403);
+  }
+
+  final nomeFile = candidatura['curriculumFile'];
+
+  if (nomeFile is! String ||
+      !RegExp(r'^[A-Za-z0-9_-]+\.pdf$').hasMatch(nomeFile)) {
+    return errore('File non valido', 404);
+  }
+
+  final file = File('uploads/curriculum/$nomeFile');
+
+  if (!file.existsSync()) {
+    return errore('Curriculum non trovato', 404);
+  }
+
+  try {
+    return Response.ok(
+      file.readAsBytesSync(),
+      headers: {
+        'content-type': 'application/pdf',
+        'content-disposition': 'attachment; filename="curriculum.pdf"',
+        'cache-control': 'no-store',
+      },
+    );
+  } catch (_) {
+    return errore('Impossibile leggere il curriculum', 500);
+  }
+}
+
+// S3: logout e invalidazione della sessione
+Response logoutAzienda(Request request) {
+  final aziendaId = aziendaAutenticata(request);
+
+  if (aziendaId == null) {
+    return errore('Sessione non valida', 401);
+  }
+
+  final autorizzazione = request.headers['authorization']!;
+  final token = autorizzazione.substring(7).trim();
+
+  // Il token non può più essere utilizzato
+  sessioni.remove(token);
+
+  return rispostaJson({'messaggio': 'Logout effettuato con successo'});
+}
+
 Future<void> main() async {
   // Prepara i file persistenti, solo se non esistono
   Directory('data').createSync(recursive: true);
@@ -384,15 +559,23 @@ Future<void> main() async {
   }
 
   // API del nostro server
+
   final router = Router()
     ..get('/', (Request request) {
       return Response.ok('Hello, World!');
     })
+    // S1: aziende e annunci
     ..post('/api/aziende', registraAzienda)
     ..post('/api/login', loginAzienda)
     ..get('/api/annunci', elencaAnnunci)
     ..post('/api/annunci', pubblicaAnnuncio)
-    ..post('/api/annunci/<id>/candidature', inviaCandidatura);
+    // S2: invio candidature
+    ..post('/api/annunci/<id>/candidature', inviaCandidatura)
+    // S3: gestione aziendale protetta
+    ..get('/api/me/annunci', annunciDellaAzienda)
+    ..get('/api/annunci/<id>/candidature', candidatureRicevute)
+    ..get('/api/candidature/<id>/curriculum', scaricaCurriculum)
+    ..post('/api/logout', logoutAzienda);
 
   final handler = Pipeline()
       .addMiddleware(logRequests())
