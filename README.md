@@ -1,4 +1,4 @@
-# JobBoard — Backend
+# JobBoard - Backend
 
 Server Dart sviluppato con `shelf` per il progetto JobBoard.
 
